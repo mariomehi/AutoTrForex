@@ -4,4 +4,3 @@ numpy
 mplfinance
 requests
 ctrader-open-api
-service_identity
