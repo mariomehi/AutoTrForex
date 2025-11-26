@@ -480,6 +480,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 # ----------------------------- MAIN -----------------------------
+
 def main():
     logging.basicConfig(level=logging.INFO)
     if TELEGRAM_TOKEN.startswith('PUT_YOUR'):
@@ -493,20 +494,12 @@ def main():
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .build()
+        # La correzione: passare job_queue=True al metodo build()
+        .build(job_queue=True) 
     )
+
+    # Rimuovi: application.job_queue.scheduler.start()
     
-    # Aggiungi questa riga dopo il build()
-    application.job_queue.scheduler.start() 
-
-    # Assicurati di passare l'oggetto job_queue al build()
-    # Metodo più pulito per la versione 20.x:
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .build(job_queue=True) # <-- CORREZIONE CHIAVE
-    )
-
     application.add_handler(CommandHandler('start', cmd_start))
     application.add_handler(CommandHandler('analizza', cmd_analizza))
     application.add_handler(CommandHandler('stop', cmd_stop))
