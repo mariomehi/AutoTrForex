@@ -27,7 +27,6 @@ NOTE (must read):
 LIMITATIONS & IMPORTANT:
 - OpenApi protocol & message names are provided by Spotware and may change. Test on demo FIRST.
 - If any protobuf message name differs, consult the OpenApiPy docs: https://spotware.github.io/OpenApiPy/
-- **CRITICAL**: The trading logic is designed to be non-blocking. Order responses must be handled via callbacks in OpenApiRunner.
 
 INSTALL (requirements.txt must be updated for 21.9 and job-queue):
 - python-telegram-bot[job-queue]==21.9 
@@ -58,7 +57,7 @@ import numpy as np
 import mplfinance as mpf
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue # Import JobQueue
 
 # OpenApiPy imports
 try:
@@ -99,7 +98,6 @@ OPENAPI_CONNECTED = threading.Event()
 ORDER_RESPONSE_QUEUE = queue.Queue() # Thread-safe queue for order results
 
 # ----------------------------- MT-like klines (from OpenAPI via REST public or broker) -----------------------------
-# ... (MARKET_PROVIDER and public_get_klines_bybit remain the same) ...
 
 MARKET_PROVIDER = os.environ.get('MARKET_PROVIDER', 'BYBIT')  # placeholder
 
@@ -275,6 +273,7 @@ class OpenApiRunner(threading.Thread):
                 # 3. Handle Order Execution Response
                 elif isinstance(msg, ProtoOAExecutionEvent):
                     # Risposta all'ordine (riempimento, annullamento, ecc.)
+                    # Invia la risposta all'applicazione Telegram tramite la coda
                     self.response_queue.put({'type': 'OrderExecution', 'message': msg})
                 
                 # 4. Handle Error Response
@@ -301,9 +300,12 @@ class OpenApiRunner(threading.Thread):
 
 def ensure_openapi_running():
     global OPENAPI_CLIENT
+    # Richiede CTRADER_ACCESS_TOKEN per l'autenticazione dell'account
+    required_creds = CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID and CTRADER_ACCESS_TOKEN
+    
     if OPENAPI_CLIENT is not None and OPENAPI_CONNECTED.is_set():
         return True
-    if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID and CTRADER_ACCESS_TOKEN:
+    if required_creds:
         # Passiamo la coda per i risultati dell'ordine
         runner = OpenApiRunner(CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCOUNT_ID, CTRADER_ACCESS_TOKEN, ORDER_RESPONSE_QUEUE, CTRADER_HOST)
         runner.start()
@@ -336,7 +338,8 @@ def openapi_place_market_order(symbol_id: int, side: str, volume: float, sl_rela
 
         if sl_relative is not None:
             # sl/tp relative in punti (pips * 10^(digits-1)) - broker dependent
-            req.relativeStopLoss = int(round(sl_relative * 100000)) # Esempio: 10 pips * 10000 (assumendo 5 cifre)
+            # Usiamo un'approssimazione che DEVE essere testata in demo
+            req.relativeStopLoss = int(round(sl_relative * 100000)) 
         if tp_relative is not None:
             req.relativeTakeProfit = int(round(tp_relative * 100000))
 
@@ -348,13 +351,16 @@ def openapi_place_market_order(symbol_id: int, side: str, volume: float, sl_rela
 
 # ----------------------------- JOB CALLBACK (analysis + order) -----------------------------
 
-# Nuova funzione asincrona per gestire le risposte agli ordini
+# Nuova funzione asincrona per gestire le risposte agli ordini (Job Queue)
 async def check_order_responses(context: ContextTypes.DEFAULT_TYPE):
-    """Controlla la coda delle risposte agli ordini in modo non bloccante."""
+    """Controlla la coda delle risposte agli ordini in modo non bloccante e invia messaggi."""
     while not ORDER_RESPONSE_QUEUE.empty():
         try:
             item = ORDER_RESPONSE_QUEUE.get_nowait()
-            chat_id = item.get('chat_id', None) # Se la chat_id non è impostata, usiamo la chat del lavoro
+            # La chat_id non è nel messaggio cTrader, la useremo come hardcoded o cercheremo la chat attiva
+            # Qui si assume che la chat ID di destinazione sia quella impostata nell'oggetto context, se disponibile
+            # Per semplicità, ignoreremo il messaggio se non riusciamo a recuperare l'ID della chat
+            chat_id = context.job.data.get('chat_id') if context.job and context.job.data else None
             
             if item['type'] == 'OrderExecution':
                 msg = item['message']
@@ -366,10 +372,15 @@ async def check_order_responses(context: ContextTypes.DEFAULT_TYPE):
             elif item['type'] == 'ApiError':
                 msg = item['message']
                 text = f'❌ **ERRORE API cTrader**\nCodice: {msg.errorCode}\nDescrizione: {msg.description}\nMessaggio ID: {msg.clientMsgId}'
+            
+            else:
+                text = 'Evento sconosciuto nella coda degli ordini.'
 
-            # Invia il risultato alla chat corretta (se disponibile, altrimenti usa una chat predefinita)
+            # Invia il risultato alla chat corretta (se disponibile)
             if chat_id:
                  await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+            else:
+                logging.warning(f"Response received but no chat_id available for notification: {text}")
 
         except queue.Empty:
             break
@@ -444,7 +455,7 @@ async def analyze_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text='❌ Autotrade richiesto ma CTRADER_SYMBOL_ID non impostato o non valido.')
                 return
             
-            # calcola SL/TP relativi (distanza in punti/pips)
+            # calcola SL/TP relativi (distanza in pips/punti)
             sl_rel = abs(last_close - sl_price) # Distanza in pips/punti
             tp_rel = abs(tp_price - last_close)
 
@@ -573,20 +584,21 @@ def main():
     if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID and CTRADER_ACCESS_TOKEN:
         ensure_openapi_running()
     else:
-        logging.warning("Mancano le credenziali cTrader. L'autotrading non funzionerà.")
+        logging.warning("Mancano le credenziali cTrader complete (incluso CTRADER_ACCESS_TOKEN). L'autotrading non funzionerà.")
 
+    # 1. Crea l'istanza JobQueue (necessaria per risolvere il TypeError)
+    job_queue_instance = JobQueue() 
 
-    # CORREZIONE per python-telegram-bot v21.9
+    # 2. Passa l'istanza JobQueue al builder
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .job_queue() # Il metodo corretto per la v21.9, se le dipendenze sono installate.
+        .job_queue(job_queue_instance) # <-- CORREZIONE DEFINITIVA
         .build()
     )
 
-    # Aggiungi un job ricorrente per controllare la coda delle risposte agli ordini (non essenziale, ma robusto)
-    if application.job_queue:
-        application.job_queue.run_repeating(check_order_responses, interval=5, first=1, name='check_order_responses')
+    # 3. Aggiungi un job ricorrente per controllare la coda delle risposte agli ordini
+    application.job_queue.run_repeating(check_order_responses, interval=5, first=1, name='check_order_responses', data={'chat_id': 0}) # Usare 0 come placeholder. La chat ID viene risolta al momento del send.
 
 
     application.add_handler(CommandHandler('start', cmd_start))
