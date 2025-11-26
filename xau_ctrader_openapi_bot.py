@@ -494,7 +494,7 @@ def main():
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .job_queue()   # <--- AGGIUNTO
+        .with_job_queue()   # <--- CORRETTO
         .build()
     )
 
