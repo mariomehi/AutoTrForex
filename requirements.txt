@@ -1,0 +1,6 @@
+python-telegram-bot==20.6
+pandas
+numpy
+mplfinance
+requests
+ctrader-open-api
