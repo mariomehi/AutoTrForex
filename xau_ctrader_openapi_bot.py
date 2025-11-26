@@ -80,7 +80,7 @@ RISK_USD = float(os.environ.get('RISK_USD', '10'))
 VOLUME_FILTER = True
 ATR_MULT_SL = 1.5
 ATR_MULT_TP = 2.0
-ENABLED_TFS = ['5m','15m','30m','1h','4h']
+ENABLED_TFS = ['1m','3m','5m','15m','30m','1h','4h']
 
 # Active analyses
 ACTIVE_ANALYSES = {}
@@ -486,7 +486,13 @@ def main():
     if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID:
         ensure_openapi_running()
 
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application = (
+    ApplicationBuilder()
+    .token(TELEGRAM_TOKEN)
+    .job_queue()   # <--- AGGIUNTO
+    .build()
+)
+
     application.add_handler(CommandHandler('start', cmd_start))
     application.add_handler(CommandHandler('analizza', cmd_analizza))
     application.add_handler(CommandHandler('stop', cmd_stop))
