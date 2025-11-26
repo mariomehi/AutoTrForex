@@ -1,1 +1,1 @@
-worker: python xau_ctrader_openapi_bot.py
+worker: python oanda_telegram_bot_fixed.py
