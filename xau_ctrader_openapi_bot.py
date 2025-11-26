@@ -12,8 +12,10 @@ ENVIRONMENT VARIABLES (set these on Railway):
 - TELEGRAM_TOKEN  -> Telegram bot token
 - CTRADER_CLIENT_ID -> cTrader Open API application Client ID
 - CTRADER_CLIENT_SECRET -> cTrader Open API application Client Secret
+- CTRADER_ACCESS_TOKEN -> REQUIRED for Account Auth (obtained via OAuth)
 - CTRADER_ACCOUNT_ID -> your cTrader Trader Account ID (numeric) (CTID account id)
 - CTRADER_HOST -> optional: 'demo' or 'live' (default 'demo')
+- CTRADER_SYMBOL_ID -> numeric ID for XAUUSD (must be known from cTrader SymbolsList)
 - RISK_USD -> numeric (default 10.0)
 
 NOTE (must read):
@@ -25,9 +27,10 @@ NOTE (must read):
 LIMITATIONS & IMPORTANT:
 - OpenApi protocol & message names are provided by Spotware and may change. Test on demo FIRST.
 - If any protobuf message name differs, consult the OpenApiPy docs: https://spotware.github.io/OpenApiPy/
+- **CRITICAL**: The trading logic is designed to be non-blocking. Order responses must be handled via callbacks in OpenApiRunner.
 
-INSTALL (requirements.txt):
-- python-telegram-bot==20.6
+INSTALL (requirements.txt must be updated for 21.9 and job-queue):
+- python-telegram-bot[job-queue]==21.9 
 - pandas
 - numpy
 - mplfinance
@@ -47,6 +50,7 @@ import logging
 import threading
 import tempfile
 import asyncio
+import queue # Used for thread-safe communication
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -73,7 +77,9 @@ except Exception as e:
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', 'PUT_YOUR_TELEGRAM_TOKEN')
 CTRADER_CLIENT_ID = os.environ.get('CTRADER_CLIENT_ID')
 CTRADER_CLIENT_SECRET = os.environ.get('CTRADER_CLIENT_SECRET')
+CTRADER_ACCESS_TOKEN = os.environ.get('CTRADER_ACCESS_TOKEN') # <-- NUOVO: Necessario per Auth
 CTRADER_ACCOUNT_ID = int(os.environ.get('CTRADER_ACCOUNT_ID', '0'))
+CTRADER_SYMBOL_ID = int(os.environ.get('CTRADER_SYMBOL_ID', '0')) # <-- NUOVO: Simbolo predefinito
 CTRADER_HOST = os.environ.get('CTRADER_HOST', 'demo').lower()  # 'demo' or 'live'
 
 RISK_USD = float(os.environ.get('RISK_USD', '10'))
@@ -90,14 +96,10 @@ ACTIVE_ANALYSES_LOCK = threading.Lock()
 OPENAPI_CLIENT = None
 OPENAPI_LOCK = threading.Lock()
 OPENAPI_CONNECTED = threading.Event()
+ORDER_RESPONSE_QUEUE = queue.Queue() # Thread-safe queue for order results
 
 # ----------------------------- MT-like klines (from OpenAPI via REST public or broker) -----------------------------
-# For simplicity we use a public market data provider (if available) or fallback to cTrader history via OpenApi (requires additional messages)
-# To keep parity with your original code, we'll implement a simple placeholder using public data via AlphaVantage or other (user can replace with their preferred source).
-
-# --- For now, we will fetch klines from a free public API (storing API usage is up to you). This is ONLY for analysis; orders use OpenApi.
-# We'll use a lightweight provider: https://finnhub.io, https://alpha-vantage.co or exchangerate.host etc.
-# Because Railway cannot rely on external keys here, the user should set MARKET_DATA_PROVIDER env vars if desired.
+# ... (MARKET_PROVIDER and public_get_klines_bybit remain the same) ...
 
 MARKET_PROVIDER = os.environ.get('MARKET_PROVIDER', 'BYBIT')  # placeholder
 
@@ -217,16 +219,20 @@ def calculate_position_size(symbol: str, entry_price: float, sl_price: float, ri
     units_per_lot = 100
     risk_per_lot = risk_per_unit * units_per_lot
     lots = risk_usd / risk_per_lot
-    return round(max(0.0, lots), 2)
+    # cTrader OpenApi richiede il volume in unità di base (es. 100000 per 1 lot standard, 10000 per 0.1 lot standard)
+    # Stiamo arrotondando a 2 decimali (0.01 lotti)
+    return round(max(0.0, lots), 2) 
 
 # ----------------------------- OPENAPI (ctrader) CLIENT THREAD -----------------------------
 
 class OpenApiRunner(threading.Thread):
-    def __init__(self, client_id, client_secret, account_id, host='demo'):
+    def __init__(self, client_id, client_secret, account_id, access_token, response_queue, host='demo'):
         super().__init__(daemon=True)
         self.client_id = client_id
         self.client_secret = client_secret
         self.account_id = account_id
+        self.access_token = access_token # Access token per l'account auth
+        self.response_queue = response_queue # Coda per inviare risultati a Telegram
         self.host = host
         self.client = None
 
@@ -240,19 +246,42 @@ class OpenApiRunner(threading.Thread):
         self.client = Client(host, port, TcpProtocol)
 
         def on_connected(client):
-            logging.info('OpenApi connected')
+            logging.info('OpenApi connected. Sending Application Auth.')
             # send application auth
             req = ProtoOAApplicationAuthReq()
             req.clientId = str(self.client_id)
             req.clientSecret = str(self.client_secret)
-            d = client.send(req)
-            d.addErrback(lambda f: logging.error('App auth err: %s', f))
+            client.send(req).addErrback(lambda f: logging.error('App auth err: %s', f))
 
         def on_message(client, message):
-            # handle incoming messages (log minimal)
             try:
                 msg = Protobuf.extract(message)
                 logging.debug('OpenApi message: %s', msg)
+                
+                # 1. Handle Application Auth Response
+                if isinstance(msg, ProtoOAApplicationAuthRes):
+                    logging.info('Application authenticated. Sending Account Auth...')
+                    # Invia la richiesta di Account Auth (CRITICA per il trading)
+                    acc_auth_req = ProtoOAAccountAuthReq()
+                    acc_auth_req.ctidTraderAccountId = self.account_id
+                    acc_auth_req.accessToken = self.access_token # DEVE ESSERE STATO OTTENUTO VIA OAUTH
+                    client.send(acc_auth_req).addErrback(lambda f: logging.error('Account auth err: %s', f))
+                    
+                # 2. Handle Account Auth Response
+                elif isinstance(msg, ProtoOAAccountAuthRes):
+                    logging.info(f'Account {self.account_id} authenticated and ready for trading.')
+                    OPENAPI_CONNECTED.set()
+                
+                # 3. Handle Order Execution Response
+                elif isinstance(msg, ProtoOAExecutionEvent):
+                    # Risposta all'ordine (riempimento, annullamento, ecc.)
+                    self.response_queue.put({'type': 'OrderExecution', 'message': msg})
+                
+                # 4. Handle Error Response
+                elif isinstance(msg, ProtoOAErrorRes):
+                    logging.error(f'cTrader API Error: Code={msg.errorCode}, Message={msg.description}, MessageID={msg.clientMsgId}')
+                    self.response_queue.put({'type': 'ApiError', 'message': msg})
+                    
             except Exception:
                 logging.exception('Failed to parse OpenApi message')
 
@@ -266,8 +295,7 @@ class OpenApiRunner(threading.Thread):
 
         self.client.startService()
         OPENAPI_CLIENT = self.client
-        # mark connected (note: real connected event after auth response, but for simplicity set it)
-        OPENAPI_CONNECTED.set()
+        # Nota: OPENAPI_CONNECTED.set() viene chiamato solo dopo l'autenticazione dell'ACCOUNT in on_message.
 
 # helper to start OpenApi
 
@@ -275,14 +303,16 @@ def ensure_openapi_running():
     global OPENAPI_CLIENT
     if OPENAPI_CLIENT is not None and OPENAPI_CONNECTED.is_set():
         return True
-    if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID:
-        runner = OpenApiRunner(CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCOUNT_ID, CTRADER_HOST)
+    if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID and CTRADER_ACCESS_TOKEN:
+        # Passiamo la coda per i risultati dell'ordine
+        runner = OpenApiRunner(CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCOUNT_ID, CTRADER_ACCESS_TOKEN, ORDER_RESPONSE_QUEUE, CTRADER_HOST)
         runner.start()
-        # wait brief
+        # attendiamo brevemente (il segnale di connessione viene dato solo dopo l'account auth)
         if not OPENAPI_CONNECTED.wait(timeout=10):
-            logging.warning('OpenApi client did not signal connection within 10s')
+            logging.warning('OpenApi client did not signal account authentication within 10s. Check tokens.')
+            return False
         return True
-    logging.warning('OpenApi credentials missing')
+    logging.warning('OpenApi credentials (Client ID/Secret, Account ID, or Access Token) missing.')
     return False
 
 # function to send market order via OpenApi client using ProtoOANewOrderReq
@@ -290,37 +320,62 @@ def ensure_openapi_running():
 def openapi_place_market_order(symbol_id: int, side: str, volume: float, sl_relative: float = None, tp_relative: float = None):
     """
     Sends a new market order request via OpenApi client.
-    - symbol_id: numeric symbol id (you may retrieve symbol list via OpenApi messages)
-    - side: 'Buy' or 'Sell'
-    - volume: lots
-    - sl_relative/tp_relative: distance in pips/points relative to entry (implementation broker-specific)
-
-    NOTE: This function is a best-effort wrapper: exact message fields and types depend on OpenApi proto definitions.
-    Test on demo.
+    - Non-blocking: Simply sends the request and returns a clientMsgId.
+    - Results are handled asynchronously via ORDER_RESPONSE_QUEUE.
     """
-    if OPENAPI_CLIENT is None:
-        return {'error': 'openapi_not_connected'}
+    if OPENAPI_CLIENT is None or not OPENAPI_CONNECTED.is_set():
+        return {'error': 'openapi_not_connected_or_authenticated'}
     try:
-        # Build ProtoOANewOrderReq (message name may be ProtoOANewOrderReq or ProtoOANewMarketOrderReq depending on your OpenApi version)
         req = ProtoOANewOrderReq()
         req.ctidTraderAccountId = int(CTRADER_ACCOUNT_ID)
         req.symbolId = int(symbol_id)
-        req.orderType = ProtoOANewOrderReq.MARKET  # enum in proto
+        req.orderType = ProtoOANewOrderReq.MARKET
         req.side = ProtoOANewOrderReq.BUY if side.lower() == 'buy' else ProtoOANewOrderReq.SELL
-        req.volume = float(volume)
+        req.volume = int(volume * 100000) # Volume in unità di base (es. 100000 per 1 lotto)
+        req.clientMsgId = f'Order_{int(time.time() * 1000)}' # ID univoco per tracciare la risposta
+
         if sl_relative is not None:
-            req.relativeStopLoss = int(round(sl_relative))
+            # sl/tp relative in punti (pips * 10^(digits-1)) - broker dependent
+            req.relativeStopLoss = int(round(sl_relative * 100000)) # Esempio: 10 pips * 10000 (assumendo 5 cifre)
         if tp_relative is not None:
-            req.relativeTakeProfit = int(round(tp_relative))
-        deferred = OPENAPI_CLIENT.send(req)
-        # We convert deferred to a blocking result with a timeout for simplicity
-        result = deferred.result if hasattr(deferred, 'result') else None
-        return {'sent': True, 'deferred': str(deferred)}
+            req.relativeTakeProfit = int(round(tp_relative * 100000))
+
+        OPENAPI_CLIENT.send(req)
+        return {'sent': True, 'clientMsgId': req.clientMsgId}
     except Exception as e:
         logging.exception('openapi_place_market_order error')
         return {'error': str(e)}
 
 # ----------------------------- JOB CALLBACK (analysis + order) -----------------------------
+
+# Nuova funzione asincrona per gestire le risposte agli ordini
+async def check_order_responses(context: ContextTypes.DEFAULT_TYPE):
+    """Controlla la coda delle risposte agli ordini in modo non bloccante."""
+    while not ORDER_RESPONSE_QUEUE.empty():
+        try:
+            item = ORDER_RESPONSE_QUEUE.get_nowait()
+            chat_id = item.get('chat_id', None) # Se la chat_id non è impostata, usiamo la chat del lavoro
+            
+            if item['type'] == 'OrderExecution':
+                msg = item['message']
+                if msg.executionType == ProtoOAExecutionEvent.ORDER_FILLED:
+                    text = f'✅ **ORDINE ESEGUITO**\nID Ordine: {msg.order.orderId}\nSimbolo: {msg.order.symbolId}\nVolume Riempito: {msg.order.executedVolume/100000.0:.2f} lots'
+                else:
+                    text = f'⚠️ **EVENTO ORDINE**\nTipo: {msg.executionType}\nOrdine ID: {msg.order.orderId}'
+            
+            elif item['type'] == 'ApiError':
+                msg = item['message']
+                text = f'❌ **ERRORE API cTrader**\nCodice: {msg.errorCode}\nDescrizione: {msg.description}\nMessaggio ID: {msg.clientMsgId}'
+
+            # Invia il risultato alla chat corretta (se disponibile, altrimenti usa una chat predefinita)
+            if chat_id:
+                 await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+
+        except queue.Empty:
+            break
+        except Exception:
+            logging.exception('Error processing order response queue item')
+
 
 async def analyze_job(context: ContextTypes.DEFAULT_TYPE):
     job_ctx = context.job.data
@@ -365,8 +420,8 @@ async def analyze_job(context: ContextTypes.DEFAULT_TYPE):
                 sl_price = df['high'].iloc[-1]
                 tp_price = last_close * (1 - 0.02)
 
-        qty = calculate_position_size(symbol, last_close, sl_price, RISK_USD)
-        if qty <= 0:
+        qty_lots = calculate_position_size(symbol, last_close, sl_price, RISK_USD)
+        if qty_lots <= 0:
             await context.bot.send_message(chat_id=chat_id, text=f'Calculated qty is 0 for {symbol}. Check parameters.')
             return
 
@@ -374,23 +429,40 @@ async def analyze_job(context: ContextTypes.DEFAULT_TYPE):
         chart_path = os.path.join(tempfile.gettempdir(), f'{symbol}_{timeframe}_{int(time.time())}.png')
         mpf.plot(df.tail(100), type='candle', style='charles', savefig=chart_path)
 
-        caption = f"Signal: {pattern} \nSide: {side}\nSymbol: {symbol} {timeframe}\nPrice: {last_close:.4f}\nSL: {sl_price:.4f}\nTP: {tp_price:.4f}\nLots(approx): {qty:.2f}"
+        caption = f"Signal: {pattern} \nSide: {side}\nSymbol: {symbol} {timeframe}\nPrice: {last_close:.4f}\nSL: {sl_price:.4f}\nTP: {tp_price:.4f}\nLots(approx): {qty_lots:.2f}"
         await context.bot.send_photo(chat_id=chat_id, photo=open(chart_path, 'rb'), caption=caption)
 
         if job_ctx.get('autotrade'):
-            # Ensure OpenApi running
-            ensure_openapi_running()
-            # You must know symbol_id on cTrader side. Many brokers expose symbolId via OpenApi 'SymbolsList' messages.
-            # For simplicity we'll assume symbol_id is provided in job_ctx or env var CTRADER_SYMBOL_ID
-            symbol_id = int(job_ctx.get('symbol_id', int(os.environ.get('CTRADER_SYMBOL_ID', '0'))))
-            if symbol_id == 0:
-                await context.bot.send_message(chat_id=chat_id, text='Autotrade richiesto ma CTRADER_SYMBOL_ID non impostato. Imposta l\'ID simbolo in variabili ambiente o usa /analizza con <symbol_id>.')
+            # Ensure OpenApi running and authenticated
+            if not ensure_openapi_running():
+                await context.bot.send_message(chat_id=chat_id, text='❌ Autotrade fallito: Connessione o Autenticazione cTrader fallita.')
                 return
-            # compute relative SL/TP in points (broker dependent). We'll send approximate absolute distances in pips * 100
-            sl_rel = abs(last_close - sl_price)
+                
+            # Recupera Symbol ID (priorità: argomento, poi variabile d'ambiente)
+            symbol_id = int(job_ctx.get('symbol_id', CTRADER_SYMBOL_ID))
+            if symbol_id == 0:
+                await context.bot.send_message(chat_id=chat_id, text='❌ Autotrade richiesto ma CTRADER_SYMBOL_ID non impostato o non valido.')
+                return
+            
+            # calcola SL/TP relativi (distanza in punti/pips)
+            sl_rel = abs(last_close - sl_price) # Distanza in pips/punti
             tp_rel = abs(tp_price - last_close)
-            order_res = await asyncio.get_running_loop().run_in_executor(None, openapi_place_market_order, symbol_id, side, qty, sl_rel, tp_rel)
-            await context.bot.send_message(chat_id=chat_id, text=f'Order result: {order_res}')
+
+            # Esegui l'ordine in modo non bloccante in un executor
+            order_res = await asyncio.get_running_loop().run_in_executor(
+                None, 
+                openapi_place_market_order, 
+                symbol_id, 
+                side, 
+                qty_lots, 
+                sl_rel, 
+                tp_rel
+            )
+            
+            if order_res.get('sent'):
+                await context.bot.send_message(chat_id=chat_id, text=f'🚀 Ordine inviato (ID: {order_res["clientMsgId"]}). Attendi la conferma di esecuzione.')
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f'❌ Invio ordine fallito: {order_res["error"]}')
 
     except Exception as e:
         logging.exception('analyze_job error')
@@ -411,10 +483,18 @@ async def cmd_analizza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = args[0].upper()
     timeframe = args[1]
     autotrade = (len(args) > 2 and args[2].lower() in ['yes','true','1'])
-    symbol_id = int(args[3]) if len(args) > 3 else None
+    # Se specificato, sovrascrive CTRADER_SYMBOL_ID di default
+    symbol_id = int(args[3]) if len(args) > 3 and args[3].isdigit() else CTRADER_SYMBOL_ID 
 
     if timeframe not in ENABLED_TFS:
         await update.message.reply_text(f'Timeframe non supportato. Abilitati: {ENABLED_TFS}')
+        return
+
+    # Mappatura del tempo d'intervallo per lo scheduler
+    interval_seconds_map = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400}
+    interval_seconds = interval_seconds_map.get(timeframe)
+    if not interval_seconds:
+        await update.message.reply_text(f'Timeframe non valido: {timeframe}.')
         return
 
     key = f'{symbol}-{timeframe}'
@@ -423,19 +503,21 @@ async def cmd_analizza(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key in chat_map:
             await update.message.reply_text(f'Già analizzando {symbol} {timeframe} in questa chat.')
             return
-        interval_seconds = int({'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400}[timeframe])
+        
+        # Calcola il tempo al prossimo intervallo esatto
         now = datetime.now(timezone.utc)
         epoch = int(now.timestamp())
         to_next = interval_seconds - (epoch % interval_seconds)
 
-        job_data = {'chat_id': chat_id, 'symbol': symbol, 'timeframe': timeframe, 'autotrade': autotrade}
-        if symbol_id:
-            job_data['symbol_id'] = symbol_id
+        job_data = {'chat_id': chat_id, 'symbol': symbol, 'timeframe': timeframe, 'autotrade': autotrade, 'symbol_id': symbol_id}
+        
+        # Usa context.application.job_queue che è ora disponibile
         job = context.application.job_queue.run_repeating(
         analyze_job,
         interval=interval_seconds,
         first=to_next,
-        data=job_data
+        data=job_data,
+        name=key
         )
         chat_map[key] = job
 
@@ -488,18 +570,25 @@ def main():
         return
 
     # Start OpenApi background runner (non-blocking)
-    if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID:
+    if CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_ACCOUNT_ID and CTRADER_ACCESS_TOKEN:
         ensure_openapi_running()
+    else:
+        logging.warning("Mancano le credenziali cTrader. L'autotrading non funzionerà.")
 
+
+    # CORREZIONE per python-telegram-bot v21.9
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        # La correzione: passare job_queue=True al metodo build()
-        .build(job_queue=True) 
+        .job_queue() # Il metodo corretto per la v21.9, se le dipendenze sono installate.
+        .build()
     )
 
-    # Rimuovi: application.job_queue.scheduler.start()
-    
+    # Aggiungi un job ricorrente per controllare la coda delle risposte agli ordini (non essenziale, ma robusto)
+    if application.job_queue:
+        application.job_queue.run_repeating(check_order_responses, interval=5, first=1, name='check_order_responses')
+
+
     application.add_handler(CommandHandler('start', cmd_start))
     application.add_handler(CommandHandler('analizza', cmd_analizza))
     application.add_handler(CommandHandler('stop', cmd_stop))
