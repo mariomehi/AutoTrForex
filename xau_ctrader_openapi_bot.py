@@ -431,7 +431,12 @@ async def cmd_analizza(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job_data = {'chat_id': chat_id, 'symbol': symbol, 'timeframe': timeframe, 'autotrade': autotrade}
         if symbol_id:
             job_data['symbol_id'] = symbol_id
-        job = context.job_queue.run_repeating(analyze_job, interval=interval_seconds, first=to_next, data=job_data)
+        job = context.application.job_queue.run_repeating(
+        analyze_job,
+        interval=interval_seconds,
+        first=to_next,
+        data=job_data
+        )
         chat_map[key] = job
 
     await update.message.reply_text(f'Iniziata analisi {symbol} {timeframe}. Autotrade: {autotrade}. SymbolId: {symbol_id}')
@@ -487,11 +492,11 @@ def main():
         ensure_openapi_running()
 
     application = (
-    ApplicationBuilder()
-    .token(TELEGRAM_TOKEN)
-    .job_queue()   # <--- AGGIUNTO
-    .build()
-)
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .job_queue()   # <--- AGGIUNTO
+        .build()
+    )
 
     application.add_handler(CommandHandler('start', cmd_start))
     application.add_handler(CommandHandler('analizza', cmd_analizza))
