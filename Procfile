@@ -1,1 +1,1 @@
-worker: python oanda_telegram_bot_fixed.py
+worker: python main.py
