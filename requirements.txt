@@ -1,6 +1,1 @@
-python-telegram-bot[job-queue]==21.9
-pandas
-numpy
-mplfinance
-requests
-ctrader-open-api
+telethon
